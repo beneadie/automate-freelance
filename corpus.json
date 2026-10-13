@@ -1,0 +1,40 @@
+[
+  {
+    "url": "example.com",
+    "note": "non-WordPress, plain 200 page",
+    "expect": { "status": "not_wordpress", "wordpress": false }
+  },
+  {
+    "url": "google.com",
+    "note": "non-WordPress, large 200 page",
+    "expect": { "status": "not_wordpress", "wordpress": false }
+  },
+  {
+    "url": "wordpress.org",
+    "note": "WordPress, block theme, no Woo",
+    "expect": { "status": "scored", "wordpress": true, "woo_store": false, "signature": "wp-includes" }
+  },
+  {
+    "url": "woocommerce.com",
+    "note": "WordPress + WooCommerce storefront",
+    "expect": { "status": "scored", "wordpress": true, "woo_store": true }
+  },
+  {
+    "url": "https://www.kerrywoollenmills.ie/",
+    "note": "WooCommerce store with Bookings extension; Divi child theme; TLS-fingerprint WAF",
+    "expect": {
+      "status": "scored",
+      "wordpress": true,
+      "woo_store": true,
+      "has_flag": "requires_human_scoping",
+      "min_products": 100,
+      "min_legacy_markers": 1,
+      "legacy_marker": "page-builder:divi"
+    }
+  },
+  {
+    "url": "this-domain-does-not-exist-xyz123.com",
+    "note": "unresolvable",
+    "expect": { "status": "unreachable" }
+  }
+]
