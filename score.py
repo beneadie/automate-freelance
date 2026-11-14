@@ -7,10 +7,13 @@ Usage:
     python score.py example.com other.com
     python score.py --json example.com
     python score.py -f domains.txt
+    python score.py -f domains.txt --batch 200 --workers 8
     python score.py --ignore-robots example.com
 
 Every signal that contributes points is printed with its points, so a score can
-always be explained. Nothing is written to disk.
+always be explained. Only WordPress sites are written to SQLite (full row with
+facts and signals); every other outcome gets a minimal row in the crawl ledger
+so --batch keeps moving. Nothing else is written to disk.
 
 Outcomes are explicit. A site is never reported as "not WordPress" unless a real
 200 page was fetched and no WordPress signatures were present. Sites that refuse
@@ -31,10 +34,11 @@ import json
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urljoin, urlparse, urlencode
+from urllib.parse import urljoin, urlparse, urlencode, unquote
 from urllib.robotparser import RobotFileParser
 
 from curl_cffi import requests
@@ -325,7 +329,7 @@ def parse_homepage(html: str, base_url: str, elapsed: float, scheme: str) -> dic
     imgs_with_alt = [i for i in imgs if i.get("alt", "").strip()]
     alt_ratio = (len(imgs_with_alt) / len(imgs)) if imgs else None
 
-    emails = sorted({a["href"].split(":", 1)[1].split("?")[0]
+    emails = sorted({unquote(a["href"].split(":", 1)[1].split("?")[0]).strip()
                      for a in soup.find_all("a", href=re.compile(r"^mailto:", re.I)) if a.get("href")})
     phones = [a.get("href") for a in soup.find_all("a", href=re.compile(r"^tel:", re.I))]
     forms = soup.find_all("form")
@@ -885,10 +889,16 @@ def main() -> int:
     ap.add_argument("domains", nargs="*", help="domains or URLs")
     ap.add_argument("-f", "--file", help="file with one domain per line")
     ap.add_argument("--json", action="store_true", help="emit full JSON array to stdout")
-    ap.add_argument("--jsonl", help="append one JSON object per site to this file")
+    ap.add_argument("--jsonl", help="append one JSON object per WordPress site to this file")
     ap.add_argument("--db", default="data/leads.db", help="SQLite path (default data/leads.db)")
     ap.add_argument("--no-db", action="store_true", help="do not write to SQLite")
     ap.add_argument("--force", action="store_true", help="re-score domains already in the database")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="also retry domains previously blocked/unreachable")
+    ap.add_argument("--batch", type=int, default=0, metavar="N",
+                    help="score at most N not-yet-checked domains this run (0 = all)")
+    ap.add_argument("--workers", type=int, default=1, metavar="N",
+                    help="fetch N sites concurrently (default 1)")
     ap.add_argument("--quiet", action="store_true", help="print only the summary, not each site")
     ap.add_argument("--ignore-robots", action="store_true", help="probe /wp-json/ even if robots.txt disallows")
     args = ap.parse_args()
@@ -901,42 +911,85 @@ def main() -> int:
         ap.print_help()
         return 1
 
-    seen: set[str] = set()
-    targets: list[str] = []
+    unique: set[str] = set()
+    deduped: list[str] = []
     duplicates = 0
     for target in inputs:
         reg = registrable_domain(host_of(target))
-        if reg in seen:
+        if reg in unique:
             duplicates += 1
             continue
-        seen.add(reg)
-        targets.append(target)
+        unique.add(reg)
+        deduped.append(target)
 
     con = None if args.no_db else store.connect(args.db)
     known = store.known_domains(con) if con else set()
+    retryable = store.retryable_domains(con) if (con and args.retry_failed) else set()
+
+    targets: list[str] = []
+    already = 0
+    for target in deduped:
+        reg = registrable_domain(host_of(target))
+        if con and not args.force:
+            if reg in known and reg not in retryable:
+                already += 1
+                continue
+        targets.append(target)
+
+    deferred = 0
+    if args.batch and len(targets) > args.batch:
+        deferred = len(targets) - args.batch
+        targets = targets[:args.batch]
+
+    def run_one(target: str) -> SiteReport:
+        try:
+            rep = collect(target, args.ignore_robots)
+            score(rep)
+            return rep
+        except Exception as exc:  # never let one bad site kill the batch
+            rep = SiteReport(target=target)
+            rep.domain = host_of(target)
+            rep.registrable = registrable_domain(rep.domain)
+            rep.status = "unreachable"
+            rep.flags.append(f"error:{type(exc).__name__}")
+            return rep
 
     reports: list[SiteReport] = []
-    skipped = 0
-    for target in targets:
-        reg = registrable_domain(host_of(target))
-        if con and not args.force and reg in known:
-            skipped += 1
-            continue
+    stored = 0
 
-        rep = collect(target, args.ignore_robots)
-        score(rep)
+    def handle(rep: SiteReport, index: int, total: int) -> None:
+        nonlocal stored
         reports.append(rep)
 
-        row = build_row(rep)
-        raw_index = row.pop("raw_index", None)
+        # Only WordPress sites get a full row (facts, reasons, REST index).
         if con:
-            store.save(con, row, raw_index.encode("utf-8") if isinstance(raw_index, str) else raw_index)
-        if args.jsonl:
-            store.append_jsonl(args.jsonl, row)
+            store.mark_seen(con, rep.registrable, rep.status, rep.tier, rep.score, rep.wordpress)
+        if rep.wordpress:
+            row = build_row(rep)
+            raw_index = row.pop("raw_index", None)
+            if con:
+                store.save(con, row, raw_index.encode("utf-8") if isinstance(raw_index, str) else raw_index)
+            if args.jsonl:
+                store.append_jsonl(args.jsonl, row)
+            stored += 1
+
+        if args.workers > 1 and not args.quiet:
+            label = rep.tier if rep.status == "scored" else rep.status
+            pts = f"{rep.score:.0f}" if rep.score is not None else "-"
+            print(f"[{index}/{total}] {rep.domain}  {label}  {pts}", file=sys.stderr)
 
         if not args.json and not args.quiet:
             print(render(rep))
             print()
+
+    if args.workers > 1:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(run_one, t) for t in targets]
+            for i, fut in enumerate(futures, 1):
+                handle(fut.result(), i, len(targets))
+    else:
+        for i, target in enumerate(targets, 1):
+            handle(run_one(target), i, len(targets))
 
     if args.json:
         print(json.dumps([r.to_dict() for r in reports], indent=2, default=str))
@@ -946,11 +999,15 @@ def main() -> int:
             key = rep.tier if rep.status == "scored" else rep.status
             counts[key] = counts.get(key, 0) + 1
         summary = "  ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "nothing to do"
-        line = f"summary: {len(reports)} scored"
-        if skipped:
-            line += f", {skipped} skipped (already stored)"
+        line = f"summary: {len(reports)} checked, {stored} wordpress"
+        if already:
+            line += f", {already} already checked"
         if duplicates:
             line += f", {duplicates} duplicate input"
+        if deferred:
+            line += f", {deferred} deferred to next batch"
+        if args.retry_failed and retryable:
+            line += f", {len(retryable)} retry eligible"
         if not args.no_db:
             line += f"  |  db={args.db}"
         print(f"{line}  |  {summary}")
