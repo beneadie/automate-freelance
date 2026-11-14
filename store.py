@@ -30,6 +30,7 @@ from typing import Any
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sites (
     registrable      TEXT PRIMARY KEY,
+    requested        TEXT,
     host             TEXT,
     url              TEXT,
     status           TEXT,
@@ -71,6 +72,7 @@ CREATE TABLE IF NOT EXISTS rest_index (
 -- (checked -> 200 -> WordPress) stays exact.
 CREATE TABLE IF NOT EXISTS seen (
     registrable  TEXT PRIMARY KEY,
+    requested    TEXT,
     status       TEXT,
     tier         TEXT,
     score        REAL,
@@ -123,7 +125,7 @@ CREATE TABLE IF NOT EXISTS kv (
 """
 
 COLUMNS = [
-    "registrable", "host", "url", "status", "http_status", "wordpress",
+    "registrable", "requested", "host", "url", "status", "http_status", "wordpress",
     "wp_signatures", "wp_version", "rest_status", "woo_store", "route_count",
     "namespace_count", "post_count", "page_count", "product_count", "score",
     "tier", "flags", "score_version", "first_seen", "scored_at", "facts",
@@ -137,6 +139,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _ensure_column(con: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    columns = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def connect(path: str) -> sqlite3.Connection:
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
@@ -145,6 +153,14 @@ def connect(path: str) -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=5000")
     con.executescript(SCHEMA)
+    # `requested` records the domain the user asked about, which is not always
+    # the domain the crawl ended on: a directory entry like hanleys.ie
+    # redirects to djhanleys.ie, and job scoping must stay on the submitted
+    # name. Added after the first release, so existing DBs need the ALTERs.
+    _ensure_column(con, "sites", "requested", "TEXT")
+    _ensure_column(con, "seen", "requested", "TEXT")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_seen_requested ON seen(requested)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_sites_requested ON sites(requested)")
     # Backfill the ledger from any rows scored before the ledger existed.
     con.execute(
         "INSERT OR IGNORE INTO seen (registrable, status, tier, score, wordpress, first_seen, checked_at) "
@@ -156,18 +172,40 @@ def connect(path: str) -> sqlite3.Connection:
 
 
 def known_domains(con: sqlite3.Connection) -> set[str]:
-    """Every domain already checked, WordPress or not."""
-    return {row[0] for row in con.execute("SELECT registrable FROM seen")}
+    """Every domain already checked, WordPress or not.
+
+    Both identifiers count: the submitted name (so the same CSV does not crawl
+    again) and the final name (so a second directory entry pointing at the same
+    site is not crawled twice).
+    """
+    return {
+        row[0]
+        for row in con.execute(
+            "SELECT registrable FROM seen "
+            "UNION SELECT requested FROM seen WHERE requested IS NOT NULL"
+        )
+    }
 
 
 def retryable_domains(con: sqlite3.Connection) -> set[str]:
     """Domains whose last attempt failed in a way a retry might fix."""
-    return {
-        row[0]
-        for row in con.execute(
-            "SELECT registrable FROM seen WHERE status IN ('blocked', 'unreachable', 'http_error')"
-        )
-    }
+    domains: set[str] = set()
+    for row in con.execute(
+        "SELECT registrable, requested FROM seen "
+        "WHERE status IN ('blocked', 'unreachable', 'http_error')"
+    ):
+        domains.update(value for value in row if value)
+    return domains
+
+
+def resolve_domain(con: sqlite3.Connection, domain: str) -> str | None:
+    """Find the stored final domain for a submitted one (identity lookup)."""
+    row = con.execute(
+        "SELECT registrable FROM seen WHERE registrable = ? "
+        "UNION SELECT registrable FROM seen WHERE requested = ? LIMIT 1",
+        (domain, domain),
+    ).fetchone()
+    return row[0] if row else None
 
 
 def mark_seen(
@@ -177,18 +215,20 @@ def mark_seen(
     tier: str,
     score: float | None,
     wordpress: bool | None,
+    requested: str | None = None,
 ) -> None:
     if not registrable:
         return
     now = _now()
     wp = None if wordpress is None else int(wordpress)
     con.execute(
-        "INSERT INTO seen (registrable, status, tier, score, wordpress, first_seen, checked_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "INSERT INTO seen (registrable, requested, status, tier, score, wordpress, first_seen, checked_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(registrable) DO UPDATE SET "
+        "requested = COALESCE(excluded.requested, seen.requested), "
         "status = excluded.status, tier = excluded.tier, score = excluded.score, "
         "wordpress = excluded.wordpress, checked_at = excluded.checked_at",
-        (registrable, status, tier, score, wp, now, now),
+        (registrable, requested, status, tier, score, wp, now, now),
     )
     con.commit()
 
@@ -362,8 +402,8 @@ def job_counts(con: sqlite3.Connection, job_id: str, lead_score: float = 40.0) -
         "  SUM(CASE WHEN st.score >= ? THEN 1 ELSE 0 END) AS leads, "
         "  SUM(CASE WHEN s.status IN ('blocked', 'unreachable', 'http_error') THEN 1 ELSE 0 END) AS blocked "
         "FROM job_domains jd "
-        "LEFT JOIN seen s ON s.registrable = jd.registrable "
-        "LEFT JOIN sites st ON st.registrable = jd.registrable "
+        "LEFT JOIN seen s ON s.registrable = jd.registrable OR s.requested = jd.registrable "
+        "LEFT JOIN sites st ON st.registrable = jd.registrable OR st.requested = jd.registrable "
         "WHERE jd.job_id = ?",
         (lead_score, job_id),
     ).fetchone()

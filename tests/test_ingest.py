@@ -85,6 +85,18 @@ class IngestTests(unittest.TestCase):
             fh.write("just some prose without delimiters\n")
         self.assertEqual(run_tick.sniff_kind(text), "unknown")
 
+    def test_status_reports_live_progress_for_running_jobs(self) -> None:
+        job_id = run_tick.ingest_file(self.client, self.con, self.cfg, self.csv_path,
+                                      chat_id=1, original_name="source.csv")
+        store.add_job_domains(self.con, job_id, {"alpha.example", "beta.example"})
+        store.mark_seen(self.con, "alpha.example", "scored", "A", 70.0, True)
+        # The stored counter is still zero, exactly like a live crawl.
+        self.assertEqual(store.get_job(self.con, job_id)["checked"], 0)
+
+        status = run_tick.command_reply(self.con, self.cfg, "/status")
+        self.assertIn("1/2 checked", status)
+        self.assertIn("1 WP", status)
+
     def test_command_status_and_retry(self) -> None:
         job_id = run_tick.ingest_file(self.client, self.con, self.cfg, self.csv_path,
                                       chat_id=1, original_name="source.csv")

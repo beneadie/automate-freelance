@@ -13,9 +13,11 @@ import store
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _save_site(con, registrable: str, score: float) -> None:
+def _save_site(con, registrable: str, score: float,
+               requested: str | None = None) -> None:
     store.save(con, {
         "registrable": registrable,
+        "requested": requested or registrable,
         "host": registrable,
         "url": f"https://{registrable}/",
         "status": "scored",
@@ -38,7 +40,8 @@ def _save_site(con, registrable: str, score: float) -> None:
         "reasons": [],
         "penalties": [],
     })
-    store.mark_seen(con, registrable, "scored", "A", score, True)
+    store.mark_seen(con, registrable, "scored", "A", score, True,
+                    requested=requested or registrable)
 
 
 class ReportJobScopeTests(unittest.TestCase):
@@ -81,6 +84,44 @@ class ReportJobScopeTests(unittest.TestCase):
             self.assertEqual(stats["job_id"], "job-1")
             self.assertEqual(stats["checked"], 1)
             self.assertEqual(stats["wordpress"], 1)
+
+    def test_redirect_reports_submitted_lead_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "leads.db")
+            con = store.connect(db)
+            store.create_job(con, "job-r", 1, 1, "galway.csv", "hash-r", 10)
+            store.add_job_domains(con, "job-r", {"hanleys.ie"})
+            _save_site(con, "djhanleys.ie", 46.0, requested="hanleys.ie")
+            con.close()
+
+            candidates = os.path.join(tmp, "candidates.json")
+            with open(candidates, "w", encoding="utf-8") as fh:
+                json.dump({"hanleys.ie": {"name": "Hanley's", "town": "Galway",
+                                          "category": "Shop"}}, fh)
+
+            out = os.path.join(tmp, "out")
+            proc = subprocess.run(
+                [sys.executable, os.path.join(BASE_DIR, "report.py"),
+                 "--db", db, "--candidates", candidates, "--outdir", out,
+                 "--job-id", "job-r"],
+                cwd=BASE_DIR, capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            with open(os.path.join(out, "all_wordpress.csv"), encoding="utf-8-sig") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(len(rows), 1)
+            # The report shows where the site actually lives, but is keyed by
+            # what the user submitted.
+            self.assertEqual(rows[0]["domain"], "djhanleys.ie")
+            self.assertEqual(rows[0]["lead_id"], "job-r:hanleys.ie")
+            self.assertEqual(rows[0]["name"], "Hanley's")
+
+            with open(os.path.join(out, "stats.json"), encoding="utf-8") as fh:
+                stats = json.load(fh)
+            self.assertEqual(stats["checked"], 1)
+            self.assertEqual(stats["wordpress"], 1)
+            self.assertEqual(stats["deferred"], 0)
 
     def test_missing_job_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -7,9 +7,11 @@ import unittest
 import store
 
 
-def _save_site(con, registrable: str, score: float = 60.0) -> None:
+def _save_site(con, registrable: str, score: float = 60.0,
+               requested: str | None = None) -> None:
     store.save(con, {
         "registrable": registrable,
+        "requested": requested or registrable,
         "host": registrable,
         "url": f"https://{registrable}/",
         "status": "scored",
@@ -32,7 +34,8 @@ def _save_site(con, registrable: str, score: float = 60.0) -> None:
         "reasons": [],
         "penalties": [],
     })
-    store.mark_seen(con, registrable, "scored", "A", score, True)
+    store.mark_seen(con, registrable, "scored", "A", score, True,
+                    requested=requested or registrable)
 
 
 class JobStoreTests(unittest.TestCase):
@@ -87,6 +90,41 @@ class JobStoreTests(unittest.TestCase):
         self.assertEqual(job["status"], "received")
         self.assertIsNone(job["finished_at"])
         self.assertIsNone(job["error"])
+
+    def test_redirect_is_counted_against_the_submitted_domain(self) -> None:
+        # hanleys.ie redirects to djhanleys.ie. The job asks about hanleys.ie.
+        store.create_job(self.con, "job-r", 42, 7, "galway.csv", "hash-r", 10)
+        store.add_job_domains(self.con, "job-r", {"hanleys.ie", "plain.ie"})
+
+        _save_site(self.con, "djhanleys.ie", 46.0, requested="hanleys.ie")
+        _save_site(self.con, "plain.ie", 61.0)
+
+        counts = store.job_counts(self.con, "job-r", lead_score=40)
+        self.assertEqual(counts["total"], 2)
+        self.assertEqual(counts["checked"], 2)
+        self.assertEqual(counts["wordpress"], 2)
+        self.assertEqual(counts["leads"], 2)
+        self.assertEqual(counts["deferred"], 0)
+
+        # Both names resolve, so a later CSV naming either one is skipped.
+        known = store.known_domains(self.con)
+        self.assertIn("hanleys.ie", known)
+        self.assertIn("djhanleys.ie", known)
+
+    def test_port_in_redirect_host_is_not_an_identity(self) -> None:
+        store.create_job(self.con, "job-p", 42, 7, "p.csv", "hash-p", 10)
+        store.add_job_domains(self.con, "job-p", {"bankofireland.com"})
+        _save_site(self.con, "bankofireland.com", 38.0,
+                   requested="bankofireland.com")
+        self.assertEqual(store.job_counts(self.con, "job-p")["deferred"], 0)
+
+    def test_migration_adds_requested_to_old_databases(self) -> None:
+        columns = {row[1] for row in self.con.execute("PRAGMA table_info(sites)")}
+        self.assertIn("requested", columns)
+        seen_columns = {row[1] for row in self.con.execute("PRAGMA table_info(seen)")}
+        self.assertIn("requested", seen_columns)
+        # Connecting again must be idempotent.
+        store.connect(os.path.join(self.tmp.name, "leads.db")).close()
 
     def test_kv(self) -> None:
         self.assertIsNone(store.get_kv(self.con, "telegram_offset"))

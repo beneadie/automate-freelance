@@ -104,9 +104,48 @@ def clean_phone(value: str) -> str:
     return value
 
 
+# Internal reason keys are terse; messages are read on a phone.
+LABELS = {
+    "certificate_invalid": "broken TLS certificate",
+    "no_https": "no HTTPS",
+    "mixed_content": "mixed content",
+    "no_mobile_layout": "no mobile layout",
+    "zoom_blocked": "zoom disabled on mobile",
+    "fixed_width_layout": "fixed-width layout",
+    "weak_responsive": "weak responsive layout",
+    "dated_front_end": "dated front end",
+    "page_weight": "heavy page",
+    "slow_server": "slow server",
+    "accessibility": "accessibility gaps",
+    "small_business_category": "small business type",
+    "possible_small_business": "possible small business",
+    "small_site": "small site",
+    "tiny_site": "very small site",
+    "mid_size_site": "mid-size site",
+    "large_site": "large site",
+    "no_ecommerce": "no online shop",
+    "small_ecommerce": "small shop",
+    "mid_ecommerce": "mid-size shop",
+    "stale_copyright": "old copyright",
+    "copyright_lagging": "copyright a year behind",
+    "no_recent_content": "no recent content",
+    "stale_theme_assets": "stale theme files",
+    "stale_core": "old WordPress core",
+    "enterprise_org": "enterprise organisation",
+    "modern_framework": "modern JS framework",
+    "agency_built": "agency built",
+    "possibly_dormant": "possibly dormant",
+    "recent_redesign": "recently redesigned",
+}
+
+
+def label(key: str) -> str:
+    return LABELS.get(key, str(key).replace("_", " "))
+
+
 def load_sites(con: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = con.execute(
-        "SELECT registrable, host, url, status, wordpress, wp_version, woo_store, "
+        "SELECT registrable, requested, host, url, status, wordpress, wp_version, woo_store, "
         "post_count, page_count, product_count, score, tier, flags, facts, reasons, "
         "penalties, scored_at FROM sites"
     ).fetchall()
@@ -117,12 +156,15 @@ def load_sites(con: sqlite3.Connection) -> list[dict[str, Any]]:
         penalties = load_json(row["penalties"], [])
         emails = facts.get("emails") or []
         phones = [clean_phone(p) for p in (facts.get("phones") or [])]
-        positives = sorted((r for r in reasons if r.get("points", 0) > 0),
+        # Reachability points are always there; they do not explain a ranking.
+        positives = sorted((r for r in reasons
+                            if r.get("points", 0) > 0 and r.get("axis") != "Reachability"),
                            key=lambda r: r.get("points", 0), reverse=True)
-        top = "; ".join(f"{r['label']} (+{r['points']:g})" for r in positives[:3])
-        pen = "; ".join(f"{p['label']} ({p['points']:g})" for p in penalties)
+        top = "; ".join(f"{label(r['label'])} (+{r['points']:g})" for r in positives[:3])
+        pen = "; ".join(f"{label(p['label'])} ({p['points']:g})" for p in penalties)
         out.append({
             "registrable": row["registrable"],
+            "requested": row["requested"] or row["registrable"],
             "domain": row["host"] or row["registrable"],
             "url": row["url"] or "",
             "score": row["score"],
@@ -192,20 +234,24 @@ def main() -> int:
 
     sites = load_sites(con)
     if job_regs is not None:
-        sites = [s for s in sites if s["registrable"] in job_regs]
+        # A submitted domain and its redirect target are both valid matches.
+        sites = [s for s in sites
+                 if s["requested"] in job_regs or s["registrable"] in job_regs]
     for site in sites:
-        meta = candidates.get(site["registrable"], {})
+        meta = candidates.get(site["requested"], {})
         site["name"] = meta.get("name", "")
         site["town"] = meta.get("town", "")
         site["category"] = meta.get("category", "")
-        site["lead_id"] = (f"{args.job_id}:{site['registrable']}"
-                           if args.job_id else site["registrable"])
+        site["lead_id"] = (f"{args.job_id}:{site['requested']}"
+                           if args.job_id else site["requested"])
 
     ledger = [dict(r) for r in con.execute(
-        "SELECT registrable, status, tier, score, wordpress, checked_at FROM seen"
+        "SELECT registrable, requested, status, tier, score, wordpress, checked_at FROM seen"
     )]
     if job_regs is not None:
-        ledger = [r for r in ledger if r["registrable"] in job_regs]
+        ledger = [r for r in ledger
+                  if (r["requested"] or r["registrable"]) in job_regs
+                  or r["registrable"] in job_regs]
     con.close()
 
     os.makedirs(args.outdir, exist_ok=True)

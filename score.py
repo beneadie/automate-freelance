@@ -130,7 +130,55 @@ AGENCY_MARKERS = (
 MODERN_FRAMEWORK_MARKERS = ("data-reactroot", "__next", "_nuxt", "__nuxt", "svelte", "data-astro-cid")
 SKIP_SCHEMES = ("http://www.w3.org", "http://schema.org", "http://purl.org", "http://ogp.me", "http://gmpg.org")
 
-SCORE_VERSION = "v1"
+# --- target fit ----------------------------------------------------------
+# Categories that reliably mean a small local business whose site was built
+# years ago. Matched against the directory name, the page title, the meta
+# description and the domain, with a leading word boundary so "accountants"
+# matches "accountant" but "barnes" does not match "bar".
+SMALL_BUSINESS_KEYWORDS = (
+    "solicitor", "attorney", "lawyer", "legal", "notary", "patent",
+    "accountant", "accounting", "bookkeep", "audit", "payroll", "tax",
+    "auctioneer", "estate agent", "real estate", "architect", "engineer",
+    "surveyor", "valuation", "mortgage broker", "insurance broker",
+    "dentist", "dental", "orthodont", "vet", "veterinary", "physio",
+    "chiropract", "osteopath", "optician", "optometrist", "pharmacy",
+    "chemist", "clinic", "medical centre", "podiatr", "counsellor",
+    "psychotherap", "creche", "montessori", "childcare", "preschool",
+    "hairdresser", "barber", "hair salon", "beauty", "nails", "tattoo",
+    "funeral", "undertaker",
+    "plumber", "plumbing", "electrician", "electrical", "heating", "boiler",
+    "builder", "carpentry", "joiner", "joinery", "roofing", "roofer",
+    "plasterer", "tiler", "tiling", "glazing", "locksmith", "mechanic",
+    "garage", "tyres", "bodyshop", "landscaping", "cleaning", "removals",
+    "courier", "bakery", "bakers", "butcher", "deli", "cafe", "coffee",
+    "restaurant", "bistro", "gastropub", "guesthouse", "florist", "flowers",
+    "craft", "pottery", "ceramic", "jewellery", "jewelry", "knitwear",
+    "woollen", "woolen", "tweed", "boutique", "bookshop", "bicycle",
+    "hardware", "groomer", "kennel", "cattery", "equestrian", "saddlery",
+    "taxi", "print", "signage", "photographer", "photography", "dance",
+    "tutoring", "grinds", "gym", "fitness", "yoga", "pilates",
+    "martial arts", "swimming", "driving school", "driving instructor",
+)
+
+# Weaker hints: real but ambiguous, so worth less than a solicitor or a bakery.
+WEAK_KEYWORDS = (
+    "hotel", "pub", "bar", "school", "arts", "centre", "shop", "store",
+    "market", "motors", "foods", "supplies", "services",
+)
+
+# Institutions and enterprises: they buy websites, but not from a cold email.
+ENTERPRISE_KEYWORDS = (
+    "university", "college", "council", "authority", "government", "hospital",
+    "bank", "plc", "holdings", "group", "international", "global", "foundation",
+    "institute of technology", "city of", "department of", "hse", "etb",
+    "technologies", "airport", "utilities", "diocese",
+)
+
+# --- scoring bands -------------------------------------------------------
+CAPS = {"Defects": 45, "Target fit": 30, "Neglect": 15, "Reachability": 15}
+TIERS = ((68.0, "A"), (52.0, "B"), (36.0, "C"))
+
+SCORE_VERSION = "v2"
 
 COMMON_SECOND_LEVEL = {
     "co.uk", "org.uk", "ac.uk", "gov.uk", "ltd.uk", "plc.uk", "me.uk", "net.uk", "sch.uk",
@@ -177,6 +225,7 @@ class SiteReport:
     url: str | None = None
     domain: str | None = None
     registrable: str | None = None
+    requested: str | None = None
     status: str = "unreachable"
     http_status: int | None = None
     wordpress: bool | None = None
@@ -201,6 +250,7 @@ class SiteReport:
         return {
             "domain": self.domain,
             "registrable": self.registrable,
+            "requested": self.requested,
             "url": self.url,
             "status": self.status,
             "http_status": self.http_status,
@@ -233,6 +283,73 @@ def normalize(target: str) -> str:
 
 def months_since(year: int, month: int) -> int:
     return (NOW.year - year) * 12 + (NOW.month - month)
+
+
+def _keyword_hits(text: str, words: tuple[str, ...]) -> list[str]:
+    low = (text or "").lower()
+    return [w for w in words if re.search(r"(?<![a-z])" + re.escape(w), low)]
+
+
+def classify_fetch_error(exc: BaseException) -> str:
+    name = type(exc).__name__
+    message = str(exc).lower()
+    if name == "CertificateVerifyError" or "certificate" in message or "ssl" in message.split():
+        return "cert"
+    if "could not resolve" in message or name == "DNSError":
+        return "dns"
+    if "timed out" in message or "timeout" in name.lower():
+        return "timeout"
+    return "other"
+
+
+def fetch_home(s: requests.Session, url: str) -> tuple[requests.Response | None, bool]:
+    """Fetch the homepage, returning (response, tls_broken).
+
+    A certificate that fails validation is a strong redesign signal, so it must
+    not be swallowed as "unreachable". When the secure fetch fails on TLS we
+    retry with verification off, record the flag, and keep crawling the page.
+    """
+    try:
+        return s.get(url, timeout=TIMEOUT, allow_redirects=True), False
+    except Exception as exc:
+        if classify_fetch_error(exc) == "cert":
+            try:
+                return s.get(url, timeout=TIMEOUT, allow_redirects=True, verify=False), True
+            except Exception:
+                return None, True
+        try:
+            return s.get(url, timeout=TIMEOUT, allow_redirects=True), False
+        except Exception:
+            return None, False
+
+
+def probe_responsive(s: requests.Session, style_urls: list[str],
+                     inline_media: int) -> dict[str, Any]:
+    """Count responsive signals in the theme CSS.
+
+    The viewport meta is emitted by every modern theme, so it cannot separate a
+    responsive site from a fixed-width one. Media queries and hardcoded pixel
+    widths can.
+    """
+    media = inline_media
+    fixed = 0
+    fetched = 0
+    for url in style_urls[:2]:
+        r = fetch(s, url)
+        if r is None or r.status_code != 200:
+            continue
+        css = r.text.lower()
+        fetched += 1
+        media += len(re.findall(r"@media", css))
+        fixed += len(re.findall(r"(?:min-)?width\s*:\s*(?:9\d\d|1\d{3})px", css))
+    return {"media_queries": media, "fixed_widths": fixed, "css_fetched": fetched}
+
+
+def extract_target_keywords(text: str) -> dict[str, Any]:
+    strong = _keyword_hits(text, SMALL_BUSINESS_KEYWORDS)
+    weak = _keyword_hits(text, WEAK_KEYWORDS)
+    enterprise = _keyword_hits(text, ENTERPRISE_KEYWORDS)
+    return {"strong": strong, "weak": weak, "enterprise": enterprise}
 
 
 def fetch(s: requests.Session, url: str, headers: dict[str, str] | None = None) -> requests.Response | None:
@@ -323,6 +440,10 @@ def parse_homepage(html: str, base_url: str, elapsed: float, scheme: str) -> dic
                   soup.find_all("meta", attrs={"name": re.compile("^generator$", re.I)})]
     generator = next((g for g in generators if "wordpress" in g.lower()), "")
     viewport = soup.find("meta", attrs={"name": re.compile("^viewport$", re.I)})
+    viewport_content = (viewport.get("content") or "").lower() if viewport else None
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    description_tag = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
+    meta_description = (description_tag.get("content") or "") if description_tag else ""
     lang = soup.html.get("lang") if soup.html else None
 
     imgs = soup.find_all("img")
@@ -354,6 +475,10 @@ def parse_homepage(html: str, base_url: str, elapsed: float, scheme: str) -> dic
 
     asset_urls = re.findall(r'(?:src|href)=["\']([^"\']+\.(?:css|js)[^"\']*)["\']', html)
     asset_url = next((urljoin(base_url, a) for a in asset_urls if "wp-content" in a), None)
+    style_urls = [urljoin(base_url, a) for a in re.findall(
+        r'href=["\']([^"\']+\.css[^"\']*)["\']', html, re.I)]
+    style_urls = [u for u in style_urls if "wp-content" in u][:3]
+    inline_media = len(re.findall(r"@media", html, re.I))
 
     legacy = legacy_era_markers(soup, html, plugin_slugs, theme_slugs, text_lower)
 
@@ -362,6 +487,14 @@ def parse_homepage(html: str, base_url: str, elapsed: float, scheme: str) -> dic
         "plugin_slugs": plugin_slugs,
         "generator": generator,
         "has_viewport": viewport is not None,
+        "viewport_content": viewport_content,
+        "zoom_blocked": bool(viewport_content
+                             and ("user-scalable=no" in viewport_content
+                                  or "maximum-scale=1" in viewport_content)),
+        "title": title[:200],
+        "meta_description": meta_description[:300],
+        "style_urls": style_urls,
+        "inline_media": inline_media,
         "lang": lang,
         "img_count": len(imgs),
         "alt_ratio": alt_ratio,
@@ -461,35 +594,35 @@ def rest_counts(s: requests.Session, rest: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
 
     def meta(route: str) -> tuple[int | None, str | None]:
-        r = fetch(s, rest_url(rest, route, {"per_page": 1, "orderby": "date", "order": "asc",
+        r = fetch(s, rest_url(rest, route, {"per_page": 1, "orderby": "date", "order": "desc",
                                             "_fields": "date"}),
                   headers={"Accept": "application/json"})
         if r is None or r.status_code != 200:
             return None, None
         v = r.headers.get("X-WP-Total")
         total = int(v) if v and v.isdigit() else None
-        oldest = None
+        newest = None
         try:
             arr = r.json()
             if isinstance(arr, list) and arr and isinstance(arr[0], dict):
-                oldest = arr[0].get("date")
+                newest = arr[0].get("date")
         except ValueError:
             pass
-        return total, oldest
+        return total, newest
 
-    post_total, post_oldest = meta("/wp/v2/posts")
-    page_total, page_oldest = meta("/wp/v2/pages")
+    post_total, post_newest = meta("/wp/v2/posts")
+    page_total, page_newest = meta("/wp/v2/pages")
     out["posts"] = post_total
     out["pages"] = page_total
 
-    dates = [d for d in (post_oldest, page_oldest) if d]
+    dates = [d for d in (post_newest, page_newest) if d]
     if rest.get("woo_store"):
-        prod_total, prod_oldest = meta("/wc/store/v1/products")
+        prod_total, prod_newest = meta("/wc/store/v1/products")
         out["products"] = prod_total
-        if prod_oldest:
-            dates.append(prod_oldest)
+        if prod_newest:
+            dates.append(prod_newest)
 
-    out["oldest_date"] = min(dates) if dates else None
+    out["newest_date"] = max(dates) if dates else None
     return out
 
 
@@ -525,19 +658,24 @@ def collect(target: str, ignore_robots: bool, business_live: bool | None = None)
     rep = SiteReport(target=target)
     s = session()
     root = normalize(target)
-    rep.domain = urlparse(root).netloc or target
+    rep.requested = registrable_domain(host_of(target))
+    rep.domain = urlparse(root).hostname or target
     rep.registrable = registrable_domain(rep.domain)
 
-    home = fetch(s, root)
+    home, tls_broken = fetch_home(s, root)
     if home is None:
         rep.status = "unreachable"
         rep.rest_status = "unreachable"
         return rep
+    if tls_broken:
+        rep.flags.append("bad_tls")
 
     rep.http_status = home.status_code
     rep.url = home.url
     parsed = urlparse(home.url)
-    rep.domain = parsed.netloc or rep.domain
+    # hostname, not netloc: a redirect may carry an explicit :443, which is not
+    # part of the site's identity.
+    rep.domain = parsed.hostname or rep.domain
     rep.registrable = registrable_domain(rep.domain)
     site_root = f"{parsed.scheme}://{parsed.netloc}"
 
@@ -567,8 +705,12 @@ def collect(target: str, ignore_robots: bool, business_live: bool | None = None)
     sigs = wordpress_signatures(html, home.headers.get("Link"))
     rep.wp_signatures = sigs
     facts = parse_homepage(html, home.url, home.elapsed.total_seconds(), parsed.scheme)
+    facts["cert_error"] = tls_broken
+    if tls_broken:
+        facts["https"] = False
     facts["rest"] = {}
     facts["business_live"] = business_live
+    facts.update(probe_responsive(s, facts.get("style_urls", []), facts.get("inline_media", 0)))
     rep.facts = facts
 
     if not sigs:
@@ -604,7 +746,13 @@ def collect(target: str, ignore_robots: bool, business_live: bool | None = None)
     return rep
 
 
-def score(rep: SiteReport) -> None:
+def score(rep: SiteReport, meta: dict[str, Any] | None = None) -> None:
+    """Score a WordPress site as a redesign prospect.
+
+    Weighting is deliberate: defects and small-business fit decide the order,
+    not size. Content volume used to be worth up to 12 points, which put city
+    councils and 3,000-page shops above a solicitor with a broken certificate.
+    """
     if rep.status == "blocked":
         rep.tier = "manual_review"
         return
@@ -617,169 +765,186 @@ def score(rep: SiteReport) -> None:
 
     f = rep.facts
     rest = f.get("rest", {})
+    meta = meta or {}
 
     def add(axis: str, label: str, points: float, detail: str = "") -> None:
         rep.reasons.append(Reason(axis, label, points, detail))
 
-    plugin_n = len(f.get("plugin_slugs", []))
-    if plugin_n <= 4:
-        add("Deliverability", "plugin_surface", 10, f"{plugin_n} front-end plugin slugs")
-    elif plugin_n <= 9:
-        add("Deliverability", "plugin_surface", 7, f"{plugin_n} front-end plugin slugs")
-    elif plugin_n <= 19:
-        add("Deliverability", "plugin_surface", 3, f"{plugin_n} front-end plugin slugs")
-    else:
-        add("Deliverability", "plugin_surface", 0, f"{plugin_n} front-end plugin slugs")
+    # --- defects: what is actually wrong with the site -------------------
+    if f.get("cert_error"):
+        add("Defects", "certificate_invalid", 12, "TLS certificate fails validation")
+    elif not f.get("https"):
+        add("Defects", "no_https", 12, "served over http")
+    elif f.get("mixed_content"):
+        add("Defects", "mixed_content", 6, "http assets on an https page")
 
-    hard_ext = rest.get("hard_extensions", [])
-    if hard_ext:
-        add("Deliverability", "commerce_complexity", 0, f"hard extensions: {', '.join(hard_ext)}")
+    media = int(f.get("media_queries") or 0)
+    fixed = int(f.get("fixed_widths") or 0)
+    if not f.get("has_viewport"):
+        add("Defects", "no_mobile_layout", 15, "no viewport meta tag")
+    elif f.get("zoom_blocked"):
+        add("Defects", "zoom_blocked", 6, "mobile zoom disabled")
+    elif fixed and media <= 3:
+        add("Defects", "fixed_width_layout", 12,
+            f"{fixed} fixed widths, {media} media queries")
+    elif fixed >= 3 and media <= 8:
+        add("Defects", "weak_responsive", 6,
+            f"{fixed} fixed widths, {media} media queries")
+
+    legacy = [m for m in (f.get("legacy_markers") or [])
+              if not m.startswith("page-builder:")]
+    if legacy:
+        add("Defects", "dated_front_end", min(len(legacy) * 3, 9), ", ".join(legacy))
+
+    kb = f.get("html_kb") or 0
+    if kb > 600:
+        add("Defects", "page_weight", 5, f"{kb} KB HTML")
+    elif kb > 300:
+        add("Defects", "page_weight", 3, f"{kb} KB HTML")
+    elif kb > 150:
+        add("Defects", "page_weight", 1, f"{kb} KB HTML")
+
+    ttfb = f.get("ttfb_s") or 0
+    if ttfb > 2.0:
+        add("Defects", "slow_server", 3, f"{ttfb}s to first byte")
+    elif ttfb > 1.5:
+        add("Defects", "slow_server", 2, f"{ttfb}s to first byte")
+
+    a11y = []
+    if not f.get("lang"):
+        a11y.append("no lang attribute")
+    alt_ratio = f.get("alt_ratio")
+    if alt_ratio is not None and alt_ratio < 0.5:
+        a11y.append(f"alt text on {round(alt_ratio * 100)}% of images")
+    if a11y:
+        add("Defects", "accessibility", 3, "; ".join(a11y))
+
+    if rest.get("hard_extensions"):
         rep.flags.append("requires_human_scoping")
-    else:
-        add("Deliverability", "commerce_complexity", 8, "no hard commerce extensions detected")
 
-    if f.get("premium_slugs"):
-        add("Deliverability", "premium_stack", 2, f"premium: {', '.join(f['premium_slugs'])}")
-    else:
-        add("Deliverability", "premium_stack", 4, "no premium stack detected")
-
-    if rest.get("menus") or rest.get("acf"):
-        bits = [k for k in ("menus", "acf") if rest.get(k)]
-        add("Deliverability", "rest_completeness", 3, "exposed: " + ", ".join(bits))
-    else:
-        add("Deliverability", "rest_completeness", 0, "menus/acf not exposed via REST")
+    # --- target fit: is this the kind of business worth emailing ---------
+    identity = " ".join(filter(None, (
+        str(meta.get("name") or ""),
+        str(meta.get("category") or ""),
+        str(f.get("title") or ""),
+        str(f.get("meta_description") or ""),
+        rep.requested or "",
+        rep.domain or "",
+    )))
+    kws = extract_target_keywords(identity)
+    if len(kws["strong"]) >= 2:
+        add("Target fit", "small_business_category", 18, ", ".join(kws["strong"][:4]))
+    elif kws["strong"]:
+        add("Target fit", "small_business_category", 14, kws["strong"][0])
+    elif kws["weak"]:
+        add("Target fit", "possible_small_business", 7, ", ".join(kws["weak"][:3]))
 
     posts = rest.get("posts") or 0
     pages = rest.get("pages") or 0
     products = rest.get("products") or 0
-    total_items = posts + pages + products
-    if total_items >= 1000:
-        add("Migration value", "content_volume", 12, f"{total_items} items")
-    elif total_items >= 200:
-        add("Migration value", "content_volume", 10, f"{total_items} items")
-    elif total_items >= 50:
-        add("Migration value", "content_volume", 8, f"{total_items} items")
-    elif total_items >= 10:
-        add("Migration value", "content_volume", 4, f"{total_items} items")
+    items = posts + pages + products
+    if 5 <= items <= 200:
+        add("Target fit", "small_site", 8, f"{items} items")
+    elif items < 5:
+        add("Target fit", "tiny_site", 4, f"{items} items")
+    elif items <= 500:
+        add("Target fit", "mid_size_site", 2, f"{items} items")
     else:
-        add("Migration value", "content_volume", 1, f"{total_items} items")
+        add("Target fit", "large_site", -8, f"{items} items, harder sale")
 
-    oldest = parse_http_date(rest.get("oldest_date")) or _iso_parse(rest.get("oldest_date"))
-    if oldest is not None:
-        age_months = (NOW.year - oldest.year) * 12 + (NOW.month - oldest.month)
-        f["content_age_months"] = age_months
-        if age_months >= 60:
-            add("Migration value", "content_age", 6, f"oldest content {age_months} months old")
-        if age_months <= 12:
-            add("Migration value", "recent_activity", 3, "content published in last 12 months")
+    if products == 0:
+        add("Target fit", "no_ecommerce", 4, "no product catalogue")
+    elif products < 30:
+        add("Target fit", "small_ecommerce", 4, f"{products} products")
+    elif products <= 200:
+        add("Target fit", "mid_ecommerce", 2, f"{products} products")
 
-    if products > 0:
-        add("Migration value", "commerce_investment", 5, f"{products} products")
-    if f.get("has_contact_form"):
-        add("Migration value", "business_function", 2, "contact form present")
-    if f.get("premium_slugs"):
-        add("Migration value", "pays_for_software", 2, "premium plugins indicate spend")
+    if kws["enterprise"]:
+        rep.penalties.append(Reason("Penalty", "enterprise_org", -15,
+                                    ", ".join(kws["enterprise"][:3])))
+        rep.flags.append("enterprise")
 
-    if not f.get("https"):
-        add("Pain", "no_https", 4, "served over http")
-    elif f.get("mixed_content"):
-        add("Pain", "mixed_content", 4, "http assets on https page")
+    # --- neglect: has anyone touched it --------------------------------
+    content_age = None
+    newest = parse_http_date(rest.get("newest_date")) or _iso_parse(rest.get("newest_date"))
+    if newest is not None:
+        content_age = (NOW.year - newest.year) * 12 + (NOW.month - newest.month)
+        f["content_age_months"] = content_age
 
-    if not f.get("has_viewport"):
-        add("Pain", "no_viewport", 3, "no mobile viewport meta")
+    cy = f.get("copyright_year")
+    if cy and cy <= NOW.year - 2:
+        add("Neglect", "stale_copyright", 5, f"footer copyright {cy}")
+    elif cy == NOW.year - 1:
+        add("Neglect", "copyright_lagging", 2, f"footer copyright {cy}")
 
-    kb = f.get("html_kb", 0)
-    if kb > 600:
-        add("Pain", "page_weight", 5, f"{kb} KB HTML")
-    elif kb > 300:
-        add("Pain", "page_weight", 3, f"{kb} KB HTML")
-    elif kb > 150:
-        add("Pain", "page_weight", 1, f"{kb} KB HTML")
-
-    if f.get("ttfb_s", 0) > 1.5:
-        add("Pain", "slow_ttfb", 2, f"{f['ttfb_s']}s")
-
-    alt_ratio = f.get("alt_ratio")
-    a11y = []
-    if not f.get("lang"):
-        a11y.append("no lang attribute")
-    if alt_ratio is not None and alt_ratio < 0.5:
-        a11y.append(f"alt coverage {round(alt_ratio * 100)}%")
-    if a11y:
-        add("Pain", "accessibility", 3, "; ".join(a11y))
-
-    legacy = f.get("legacy_markers", [])
-    if legacy:
-        add("Pain", "legacy_era_markers", min(len(legacy), 6), ", ".join(legacy))
-
-    if f.get("has_analytics") and not f.get("has_consent_banner"):
-        add("Pain", "analytics_no_consent", 2, "tracking without consent banner")
+    if content_age is not None and content_age > 60:
+        add("Neglect", "no_recent_content", 5, f"no new content for {content_age} months")
+    elif content_age is not None and content_age > 18:
+        add("Neglect", "no_recent_content", 2, f"no new content for {content_age} months")
 
     lm = parse_http_date(f.get("last_modified"))
     if lm is not None:
-        age_months = (NOW.year - lm.year) * 12 + (NOW.month - lm.month)
-        f["asset_age_months"] = age_months
-        if age_months >= 18:
-            add("Abandonment", "stale_assets", 5, f"theme asset untouched {age_months} months")
-        elif age_months <= 6:
-            content_fresh = f.get("content_age_months") is not None and f["content_age_months"] <= 12
-            footer_fresh = f.get("copyright_year") == NOW.year
-            if content_fresh or footer_fresh:
-                rep.penalties.append(Reason("Penalty", "recent_redesign", -8,
-                                            f"theme asset modified {age_months} months ago and site otherwise current"))
-            else:
-                f["recent_asset_only"] = True
+        asset_age = (NOW.year - lm.year) * 12 + (NOW.month - lm.month)
+        f["asset_age_months"] = asset_age
+        if asset_age >= 18:
+            add("Neglect", "stale_theme_assets", 3,
+                f"theme files untouched {asset_age} months")
 
     if rep.wp_version:
         rel = WP_RELEASES.get(rep.wp_version)
         if rel is not None and months_since(*rel) > 18:
-            add("Abandonment", "stale_core", 3, f"WordPress {rep.wp_version}")
-
-    cy = f.get("copyright_year")
-    if cy and cy < NOW.year - 1:
-        add("Abandonment", "stale_copyright", 3, f"footer copyright {cy}")
+            add("Neglect", "stale_core", 2, f"WordPress {rep.wp_version}")
 
     live = f.get("business_live")
-    stale_months = f.get("content_age_months")
-    if stale_months is not None and stale_months > 18:
-        points = 6 if live is True else 4
-        add("Abandonment", "stale_content", points, f"no new content in {stale_months} months")
-        if live is True:
-            rep.flags.append("neglected_but_live")
     if live is False:
-        rep.penalties.append(Reason("Penalty", "possibly_dormant", -6, "business liveness: dormant"))
+        rep.penalties.append(Reason("Penalty", "possibly_dormant", -6,
+                                    "business appears dormant"))
         rep.flags.append("possibly_dormant")
 
+    # --- reachability ---------------------------------------------------
     if f.get("emails"):
-        add("Reachability", "email", 5, f["emails"][0])
+        add("Reachability", "email", 7, f["emails"][0])
     if f.get("phones"):
-        add("Reachability", "phone", 3, "public phone number")
+        add("Reachability", "phone", 5, "public phone number")
     if f.get("has_contact_form"):
-        add("Reachability", "contact_form", 2, "contact form")
+        add("Reachability", "contact_form", 3, "contact form")
 
+    # --- penalties ------------------------------------------------------
+    if f.get("modern_framework"):
+        rep.penalties.append(Reason("Penalty", "modern_framework", -12,
+                                    "React/Next/Nuxt front end, not a WordPress rebuild"))
     if f.get("agency_credit"):
-        rep.penalties.append(Reason("Penalty", "agency_credit", -10, f"footer mentions '{f['agency_credit']}'"))
+        rep.penalties.append(Reason("Penalty", "agency_built", -4,
+                                    f"footer mentions '{f['agency_credit']}'"))
 
-    caps = {"Deliverability": 25, "Migration value": 30, "Pain": 20, "Abandonment": 15, "Reachability": 10}
+    # A page builder rewriting its own CSS bumps Last-Modified constantly, so a
+    # fresh asset alone is not a redesign. Require corroboration before
+    # discounting a site.
+    fresh = (
+        f.get("asset_age_months") is not None and f["asset_age_months"] <= 6,
+        content_age is not None and content_age <= 12,
+        cy == NOW.year,
+    )
+    if sum(fresh) >= 2:
+        rep.penalties.append(Reason("Penalty", "recent_redesign", -8,
+                                    "recently refreshed theme, content and copyright"))
+
+    # --- total ----------------------------------------------------------
     totals: dict[str, float] = {}
     for r in rep.reasons:
         totals[r.axis] = totals.get(r.axis, 0.0) + r.points
-    capped = sum(min(totals.get(a, 0.0), cap) for a, cap in caps.items())
+    capped = sum(max(0.0, min(totals.get(axis, 0.0), cap))
+                 for axis, cap in CAPS.items())
     penalty = sum(p.points for p in rep.penalties)
     rep.score = round(max(0.0, min(100.0, capped + penalty)), 1)
     rep.facts["axis_raw"] = {k: round(v, 1) for k, v in totals.items()}
 
-    if rep.score >= 75:
-        rep.tier = "A"
-    elif rep.score >= 55:
-        rep.tier = "B"
-    elif rep.score >= 35:
-        rep.tier = "C"
+    for cut, label in TIERS:
+        if rep.score >= cut:
+            rep.tier = label
+            break
     else:
         rep.tier = "discard"
-
-    if "requires_human_scoping" in rep.flags:
-        rep.tier = "manual_review"
 
 
 def _iso_parse(value: Any) -> datetime | None:
@@ -798,9 +963,6 @@ STATUS_LABEL = {
     "not_wordpress": "NOT WORDPRESS — 200 page with no WordPress signatures",
 }
 
-CAPS = {"Deliverability": 25, "Migration value": 30, "Pain": 20, "Abandonment": 15, "Reachability": 10}
-
-
 def render(rep: SiteReport) -> str:
     lines = [f"=== {rep.url or rep.target} ==="]
     lines.append(f"status       {rep.status}  (http {rep.http_status})" if rep.http_status
@@ -814,7 +976,7 @@ def render(rep: SiteReport) -> str:
         lines.append(f"rest         ok")
         lines.append(f"namespaces   {rest.get('namespace_count')}  routes={rest.get('route_count')}")
         lines.append(f"woo          store={rest.get('woo_store')}  legacy_api={rest.get('woo_legacy_api')}  acf={rest.get('acf')}  menus={rest.get('menus')}")
-        lines.append(f"counts       posts={rest.get('posts')} pages={rest.get('pages')} products={rest.get('products')} oldest={rest.get('oldest_date')}")
+        lines.append(f"counts       posts={rest.get('posts')} pages={rest.get('pages')} products={rest.get('products')} newest={rest.get('newest_date')}")
     else:
         lines.append(f"rest         {rep.rest_status}")
     if f:
@@ -834,7 +996,7 @@ def render(rep: SiteReport) -> str:
         lines.append(f"note         REST unusable ({rep.rest_status}); scored on frontend only")
 
     lines.append("")
-    for axis in ["Deliverability", "Migration value", "Pain", "Abandonment", "Reachability"]:
+    for axis in ["Defects", "Target fit", "Neglect", "Reachability"]:
         pts = [r for r in rep.reasons if r.axis == axis]
         lines.append(f"{axis:<16} {sum(r.points for r in pts):>5.1f}/{CAPS[axis]}")
         for r in pts:
@@ -859,6 +1021,7 @@ def build_row(rep: SiteReport) -> dict[str, Any]:
     facts["rest"] = rest
     return {
         "registrable": rep.registrable,
+        "requested": rep.requested,
         "host": rep.domain,
         "url": rep.url,
         "status": rep.status,
@@ -901,7 +1064,13 @@ def main() -> int:
                     help="fetch N sites concurrently (default 1)")
     ap.add_argument("--quiet", action="store_true", help="print only the summary, not each site")
     ap.add_argument("--ignore-robots", action="store_true", help="probe /wp-json/ even if robots.txt disallows")
+    ap.add_argument("--candidates", help="discover.py candidates.json for business name/category")
     args = ap.parse_args()
+
+    candidates: dict[str, Any] = {}
+    if args.candidates and os.path.exists(args.candidates):
+        with open(args.candidates, encoding="utf-8") as fh:
+            candidates = json.load(fh)
 
     inputs = list(args.domains)
     if args.file:
@@ -944,10 +1113,12 @@ def main() -> int:
     def run_one(target: str) -> SiteReport:
         try:
             rep = collect(target, args.ignore_robots)
-            score(rep)
+            meta = candidates.get(rep.requested or "", {})
+            score(rep, meta)
             return rep
         except Exception as exc:  # never let one bad site kill the batch
             rep = SiteReport(target=target)
+            rep.requested = registrable_domain(host_of(target))
             rep.domain = host_of(target)
             rep.registrable = registrable_domain(rep.domain)
             rep.status = "unreachable"
@@ -963,7 +1134,8 @@ def main() -> int:
 
         # Only WordPress sites get a full row (facts, reasons, REST index).
         if con:
-            store.mark_seen(con, rep.registrable, rep.status, rep.tier, rep.score, rep.wordpress)
+            store.mark_seen(con, rep.registrable, rep.status, rep.tier, rep.score,
+                            rep.wordpress, requested=rep.requested)
         if rep.wordpress:
             row = build_row(rep)
             raw_index = row.pop("raw_index", None)

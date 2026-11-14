@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 import run_tick
+import store
 from telegram_api import TelegramError
 
 
@@ -115,12 +116,14 @@ class SendTests(unittest.TestCase):
             allowed_chats={1},
             dry_run=True,  # keeps pacing at zero; separate test covers the sleep
         )
+        self.con = store.connect(self.cfg.db_path)
         self.job = {"job_id": "job-1", "file_name": "galway.csv", "chat_id": 1,
                     "status": "done"}
         self.counts = {"total": 3, "checked": 3, "wordpress": 2, "leads": 1,
                        "blocked": 1, "deferred": 0}
 
     def tearDown(self) -> None:
+        self.con.close()
         self.tmp.cleanup()
 
     def test_one_message_per_wordpress_site_best_first(self) -> None:
@@ -129,7 +132,7 @@ class SendTests(unittest.TestCase):
             make_row(domain="stronger.ie", name="Stronger", score="88.0"),
         ])
         client = RecordingClient()
-        sent = run_tick.send_report(client, self.job, self.counts, self.report, self.cfg)
+        sent = run_tick.send_report(client, self.con, self.job, self.counts, self.report, self.cfg)
 
         self.assertEqual(sent, 2)
         self.assertEqual(len(client.messages), 4)  # header + 2 sites + footer
@@ -150,7 +153,7 @@ class SendTests(unittest.TestCase):
         write_report(self.report, [])
         counts = dict(self.counts, wordpress=0, leads=0)
         client = RecordingClient()
-        sent = run_tick.send_report(client, self.job, counts, self.report, self.cfg)
+        sent = run_tick.send_report(client, self.con, self.job, counts, self.report, self.cfg)
 
         self.assertEqual(sent, 0)
         self.assertEqual(len(client.messages), 2)
@@ -159,7 +162,7 @@ class SendTests(unittest.TestCase):
     def test_client_is_never_asked_for_documents(self) -> None:
         write_report(self.report, [make_row()])
         client = RecordingClient()  # has no send_document at all
-        run_tick.send_report(client, self.job, self.counts, self.report, self.cfg)
+        run_tick.send_report(client, self.con, self.job, self.counts, self.report, self.cfg)
         self.assertEqual(len(client.messages), 3)
 
     def test_retries_after_rate_limit(self) -> None:
@@ -180,6 +183,48 @@ class SendTests(unittest.TestCase):
 
         self.assertEqual(sleeps, [1.05, 1.05])  # no sleep after the last message
         self.assertEqual(len(client.messages), 3)
+
+    def test_resume_does_not_repeat_delivered_messages(self) -> None:
+        write_report(self.report, [
+            make_row(domain="one.ie", name="One", score="90.0"),
+            make_row(domain="two.ie", name="Two", score="50.0"),
+            make_row(domain="three.ie", name="Three", score="30.0"),
+        ])
+        store.set_kv(self.con, "sending_job-1", "2")
+
+        client = RecordingClient()
+        sent = run_tick.send_report(client, self.con, self.job, self.counts,
+                                    self.report, self.cfg)
+
+        self.assertEqual(sent, 3)
+        texts = [text for _, text in client.messages]
+        self.assertFalse(any("Job job-1" in t for t in texts))  # no duplicate header
+        self.assertTrue(any("Resuming" in t for t in texts))
+        site_texts = [t for t in texts if t.startswith("#")]
+        self.assertEqual(len(site_texts), 1)
+        self.assertTrue(site_texts[0].startswith("#3 of 3"))
+        self.assertIn("3 WordPress site(s) sent", texts[-1])
+
+    def test_transient_socket_error_is_retried(self) -> None:
+        class Flaky(RecordingClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail = 1
+
+            def send_message(self, chat_id: int | str, text: str) -> None:
+                if self.fail:
+                    self.fail -= 1
+                    raise TelegramError("sendMessage: [Errno 104] Connection reset by peer")
+                super().send_message(chat_id, text)
+
+        sleeps: list[float] = []
+        client = Flaky()
+        sent = run_tick.send_site_messages(
+            client, 1, [make_row()], sleep=sleeps.append, interval=0)
+
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(client.messages), 1)
+        self.assertEqual(sleeps, [2.0])
 
     def test_gives_up_when_rate_limit_never_clears(self) -> None:
         client = FlakyClient(failures=99, retry_after=1)

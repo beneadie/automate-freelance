@@ -330,6 +330,14 @@ def command_reply(con: Any, cfg: Config, text: str) -> str:
             return "No jobs yet. Send me a CSV."
         lines = ["Recent jobs:"]
         for job in jobs:
+            # Stored counts are written when the crawl exits, so a running job
+            # would otherwise report 0/0 and look dead. Compute those live.
+            if job["status"] in ("received", "processing"):
+                live = store.job_counts(con, job["job_id"], cfg.lead_score)
+                job["total_domains"] = live["total"]
+                job["checked"] = live["checked"]
+                job["wordpress"] = live["wordpress"]
+                job["leads"] = live["leads"]
             lines.append(
                 f"{job['job_id']}  {job['status']:<10}  "
                 f"{job['checked']}/{job['total_domains']} checked  "
@@ -459,28 +467,35 @@ def site_message(rank: int, total: int, row: dict[str, str]) -> str:
 
 
 def send_site_messages(client: Any, chat_id: int | str, rows: list[dict[str, str]],
-                       sleep: Any = time.sleep, interval: float = SEND_INTERVAL) -> int:
+                       sleep: Any = time.sleep, interval: float = SEND_INTERVAL,
+                       start: int = 0, on_sent: Any = None) -> int:
     """Send one message per site, paced under Telegram's per-chat flood limit.
 
     A 429 carries retry_after; sleeping that long is what keeps a 100-message
-    report from being silently truncated by a temporary block.
+    report from being silently truncated by a temporary block. Transient
+    socket errors get a short backoff instead of aborting the whole report.
+    `start` resumes after a partially delivered run, and `on_sent` records each
+    success so the next attempt never repeats a message.
     """
     total = len(rows)
-    sent = 0
-    for index, row in enumerate(rows, 1):
+    for index, row in enumerate(rows[start:], start + 1):
         text = site_message(index, total, row)
         for attempt in range(SEND_RETRIES + 1):
             try:
                 client.send_message(chat_id, text)
                 break
             except TelegramError as exc:
-                if exc.retry_after is None or attempt >= SEND_RETRIES:
+                if attempt >= SEND_RETRIES:
                     raise
-                sleep(min(float(exc.retry_after) + 1.0, 120.0))
-        sent += 1
+                if exc.retry_after is not None:
+                    sleep(min(float(exc.retry_after) + 1.0, 120.0))
+                else:
+                    sleep(min(2.0 * (attempt + 1), 10.0))
+        if on_sent is not None:
+            on_sent(index)
         if interval and index < total:
             sleep(interval)
-    return sent
+    return total
 
 
 def result_text(job: dict, counts: dict[str, int], cfg: Config) -> str:
@@ -496,11 +511,14 @@ def result_text(job: dict, counts: dict[str, int], cfg: Config) -> str:
     ])
 
 
-def send_report(client: Any, job: dict, counts: dict[str, int],
+def send_report(client: Any, con: Any, job: dict, counts: dict[str, int],
                 report_path: str | None, cfg: Config) -> int:
     """Deliver one message per WordPress site. No attachment is ever sent."""
     chat_id = job.get("chat_id")
     rows = report_rows(report_path) if report_path and os.path.exists(report_path) else []
+    progress_key = f"sending_{job['job_id']}"
+    delivered = int(store.get_kv(con, progress_key) or 0)
+    delivered = max(0, min(delivered, len(rows)))
 
     header = "\n".join([
         f"Job {job['job_id']} — {_clean(job.get('file_name'))}",
@@ -519,27 +537,34 @@ def send_report(client: Any, job: dict, counts: dict[str, int],
             print()
         return 0
 
-    if not _notify(client, chat_id, header):
+    if delivered == 0 and not _notify(client, chat_id, header):
         return 0
+    if delivered and rows:
+        _notify(client, chat_id,
+                f"Resuming {job['job_id']} at #{delivered + 1} of {len(rows)}.")
     try:
         sent = send_site_messages(
             client, chat_id, rows,
             interval=0.0 if cfg.dry_run else SEND_INTERVAL,
+            start=delivered,
+            on_sent=lambda count: store.set_kv(con, progress_key, str(count)),
         )
     except TelegramError as exc:
         # Scoring already succeeded, so the job stays retryable and cheap: the
-        # crawl ledger is warm, only the report and sends are repeated.
+        # crawl ledger is warm and delivery resumes from the last sent message.
         _notify(client, chat_id,
-                f"Sending stopped early ({exc}).\n"
-                f"{job['job_id']} is scored; /retry {job['job_id']} will resend it.")
+                f"Sending stopped at #{delivered} of {len(rows)} ({exc}).\n"
+                f"/retry {job['job_id']} will continue from there.")
         raise
     _notify(client, chat_id,
             f"Done — {job['job_id']}: {sent} WordPress site(s) sent, "
             f"{counts['leads']} at or above {cfg.lead_score:g}.")
+    store.set_kv(con, progress_key, "0")  # finished: a manual /retry resends all
     return sent
 
 
-def process_job(client: Any, con: Any, cfg: Config, job: dict) -> bool:
+def process_job(client: Any, con: Any, cfg: Config, job: dict,
+                force: bool = False) -> bool:
     """Run one job. Returns True when it is fully finished."""
     job_id = job["job_id"]
     job_dir = os.path.join(cfg.upload_dir, job_id)
@@ -565,11 +590,15 @@ def process_job(client: Any, con: Any, cfg: Config, job: dict) -> bool:
     if counts["total"] == 0:
         raise RuntimeError("job has no domains")
 
-    if counts["deferred"]:
-        _run([sys.executable, os.path.join(BASE_DIR, "score.py"),
-              "-f", domains_path, "--db", cfg.db_path,
-              "--workers", str(cfg.workers),
-              "--batch", str(cfg.domains_per_tick), "--quiet"])
+    if counts["deferred"] or force:
+        cmd = [sys.executable, os.path.join(BASE_DIR, "score.py"),
+               "-f", domains_path, "--db", cfg.db_path,
+               "--workers", str(cfg.workers),
+               "--batch", str(0 if force else cfg.domains_per_tick), "--quiet",
+               "--candidates", os.path.join(job_dir, "candidates.json")]
+        if force:
+            cmd.append("--force")
+        _run(cmd)
         counts = store.job_counts(con, job_id, cfg.lead_score)
         store.save_job_counts(con, job_id, counts)
         job = store.get_job(con, job_id) or job
@@ -595,7 +624,7 @@ def process_job(client: Any, con: Any, cfg: Config, job: dict) -> bool:
     store.save_job_counts(con, job_id, counts)
     store.set_job_status(con, job_id, "done", finished=True, report_path=report_path)
     job = store.get_job(con, job_id) or job
-    send_report(client, job, counts, report_path, cfg)
+    send_report(client, con, job, counts, report_path, cfg)
     print(f"{job_id}: done, {counts['wordpress']} wordpress, {counts['leads']} leads")
     return True
 
@@ -637,6 +666,8 @@ def main() -> int:
     ap.add_argument("--ingest-file", help="queue a local CSV instead of polling Telegram")
     ap.add_argument("--chat-id", type=int, default=0, help="chat ID to attribute --ingest-file")
     ap.add_argument("--no-process", action="store_true", help="ingest only, do not score")
+    ap.add_argument("--rescore", metavar="JOB_ID",
+                    help="re-crawl and re-send one existing job (new scoring)")
     args = ap.parse_args()
 
     load_dotenv()
@@ -666,6 +697,18 @@ def main() -> int:
                                  chat_id=args.chat_id,
                                  original_name=os.path.basename(args.ingest_file))
             print(f"local: queued {job_id}" if job_id else "local: nothing queued")
+
+        if args.rescore:
+            job = store.get_job(con, args.rescore)
+            if job is None:
+                raise SystemExit(f"no job {args.rescore!r}")
+            store.retry_job(con, args.rescore)
+            store.set_kv(con, f"sending_{args.rescore}", "0")
+            store.set_job_status(con, args.rescore, "processing")
+            job = store.get_job(con, args.rescore) or job
+            finished = process_job(client, con, cfg, job, force=True)
+            print(f"rescore: {'finished' if finished else 'deferred'}")
+            return 0
 
         if not args.no_process:
             finished = process_jobs(client, con, cfg)
