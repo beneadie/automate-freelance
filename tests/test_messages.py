@@ -4,6 +4,7 @@ import csv
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import run_tick
 import store
@@ -147,7 +148,8 @@ class SendTests(unittest.TestCase):
         self.assertIn("Stronger", first)
         self.assertTrue(second.startswith("#2 of 2 · 41 pts"))
         self.assertIn("Weaker", second)
-        self.assertIn("2 WordPress site(s) sent", footer)
+        self.assertTrue(footer.startswith("TOP 2"))
+        self.assertIn("2 WordPress", footer)
 
     def test_no_wordpress_sends_only_header_and_footer(self) -> None:
         write_report(self.report, [])
@@ -203,7 +205,42 @@ class SendTests(unittest.TestCase):
         site_texts = [t for t in texts if t.startswith("#")]
         self.assertEqual(len(site_texts), 1)
         self.assertTrue(site_texts[0].startswith("#3 of 3"))
-        self.assertIn("3 WordPress site(s) sent", texts[-1])
+        self.assertTrue(texts[-1].startswith("TOP 3"))
+
+    def test_digest_lists_top_twenty_and_says_how_many_remain(self) -> None:
+        rows = [make_row(domain=f"site{i}.ie", name=f"Site {i}", score=str(90 - i))
+                for i in range(25)]
+        write_report(self.report, rows)
+        client = RecordingClient()
+        run_tick.send_report(client, self.con, self.job, self.counts,
+                             self.report, self.cfg)
+
+        texts = [text for _, text in client.messages]
+        self.assertEqual(len(texts), 1 + 25 + 1)
+        digest = texts[-1]
+        self.assertTrue(digest.startswith("TOP 20"))
+        self.assertIn("1. 90 · A · Site 0 — site0.ie", digest)
+        self.assertIn("5 more in the site messages above.", digest)
+        self.assertNotIn("site20.ie", digest)
+        self.assertIn("info@claddaghmotors.ie", digest)
+
+    def test_digest_can_be_disabled(self) -> None:
+        write_report(self.report, [make_row()])
+        with mock.patch.dict(os.environ, {"TOP_SUMMARY": "0"}):
+            client = RecordingClient()
+            run_tick.send_report(client, self.con, self.job, self.counts,
+                                 self.report, self.cfg)
+        self.assertTrue(client.messages[-1][1].startswith("Done —"))
+
+    def test_short_job_digest_has_no_remainder_line(self) -> None:
+        write_report(self.report, [make_row(domain="a.ie", name="A", score="55"),
+                                   make_row(domain="b.ie", name="B", score="44")])
+        client = RecordingClient()
+        run_tick.send_report(client, self.con, self.job, self.counts,
+                             self.report, self.cfg)
+        digest = client.messages[-1][1]
+        self.assertTrue(digest.startswith("TOP 2"))
+        self.assertNotIn("more in the site messages", digest)
 
     def test_transient_socket_error_is_retried(self) -> None:
         class Flaky(RecordingClient):

@@ -82,7 +82,7 @@ def band_of(score: float | None, bands: list[tuple[str, float, float]]) -> str:
 def wilson(successes: int, total: int, z: float = 1.96) -> tuple[float, float]:
     if total <= 0:
         return (0.0, 0.0)
-    p = successes / total
+    p = min(1.0, max(0.0, successes / total))
     denom = 1 + z * z / total
     centre = (p + z * z / (2 * total)) / denom
     half = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / denom
@@ -156,11 +156,16 @@ def load_sites(con: sqlite3.Connection) -> list[dict[str, Any]]:
         penalties = load_json(row["penalties"], [])
         emails = facts.get("emails") or []
         phones = [clean_phone(p) for p in (facts.get("phones") or [])]
-        # Reachability points are always there; they do not explain a ranking.
-        positives = sorted((r for r in reasons
-                            if r.get("points", 0) > 0 and r.get("axis") != "Reachability"),
-                           key=lambda r: r.get("points", 0), reverse=True)
-        top = "; ".join(f"{label(r['label'])} (+{r['points']:g})" for r in positives[:3])
+        # Defects explain a ranking; reachability is always there. Show up to
+        # two defects first, then the strongest fit signal.
+        positives = [r for r in reasons
+                     if r.get("points", 0) > 0 and r.get("axis") != "Reachability"]
+        defects = sorted((r for r in positives if r.get("axis") == "Defects"),
+                         key=lambda r: r.get("points", 0), reverse=True)[:2]
+        fit = sorted((r for r in positives if r.get("axis") != "Defects"),
+                     key=lambda r: r.get("points", 0), reverse=True)
+        chosen = (defects + fit)[:3]
+        top = "; ".join(f"{label(r['label'])} (+{r['points']:g})" for r in chosen)
         pen = "; ".join(f"{label(p['label'])} ({p['points']:g})" for p in penalties)
         out.append({
             "registrable": row["registrable"],
@@ -284,8 +289,9 @@ def main() -> int:
     at_least_lead = sum(1 for s in sites if (s["score"] or 0) >= args.lead_score)
     lead_label = f"{args.lead_score:g}+"
 
-    wp_rate = wp / plain_200 if plain_200 else 0.0
-    wp_lo, wp_hi = wilson(wp, plain_200)
+    responses_200 = wp + plain_200
+    wp_rate = wp / responses_200 if responses_200 else 0.0
+    wp_lo, wp_hi = wilson(wp, responses_200)
 
     lead_rate_all = at_least_lead / checked if checked else 0.0
     lead_lo_all, lead_hi_all = wilson(at_least_lead, checked)
@@ -319,7 +325,7 @@ def main() -> int:
         add(f"  deferred               {deferred}")
     add("")
     add(f"WordPress share of reachable 200s   {pct(wp_rate)}  "
-        f"(95% CI {pct(wp_lo)}-{pct(wp_hi)}, n={plain_200})")
+        f"(95% CI {pct(wp_lo)}-{pct(wp_hi)}, n={responses_200})")
     add("")
     add("Score bands (WordPress only)")
     for band, _, _ in bands:

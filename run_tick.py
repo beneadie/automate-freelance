@@ -6,6 +6,8 @@ One Railway cron tick: ingest Telegram uploads, then process queued jobs.
     python run_tick.py
     python run_tick.py --dry-run --ingest-file data/sample.csv
     python run_tick.py --dry-run --ingest-file data/sample.csv --no-process
+    python run_tick.py --rescore 20260101-120000-ab12cd   # re-crawl one job
+    python run_tick.py --resend  20260101-120000-ab12cd   # re-send without crawling
 
 A tick is intentionally short-lived and exits cleanly so Railway's cron
 scheduler can start the next one. Jobs that do not finish within
@@ -22,6 +24,7 @@ Environment:
     DOMAINS_PER_TICK             domains scored per job per tick (default: 150)
     MAX_JOBS_PER_TICK           jobs touched per tick (default: 3)
     LEAD_SCORE                  score threshold counted as a lead (default: 40)
+    TOP_SUMMARY                 sites in the final digest message (default: 20, 0 disables)
 
 Reports sent back to Telegram contain WordPress sites only, delivered as one
 message per site, best score first. Non-WordPress, blocked and deferred domains
@@ -63,6 +66,7 @@ HELP = (
     "score first.\n\n"
     "/status - recent jobs\n"
     "/retry <job_id> - run a job again\n"
+    "/rescore <job_id> - re-crawl a job with the current scoring\n"
     "/help - this message\n\n"
     "CSV up to 20 MB. Excel files are not read: use File > Save As > CSV."
 )
@@ -353,6 +357,18 @@ def command_reply(con: Any, cfg: Config, text: str) -> str:
             return f"No job {job_id}."
         store.retry_job(con, job_id)
         return f"Job {job_id} queued again."
+    if command == "/rescore":
+        if len(words) < 2:
+            return "Usage: /rescore <job_id>"
+        job_id = words[1]
+        job = store.get_job(con, job_id)
+        if job is None:
+            return f"No job {job_id}."
+        store.retry_job(con, job_id)
+        store.set_kv(con, f"rescore_{job_id}", "1")
+        store.set_kv(con, f"sending_{job_id}", "0")
+        return (f"Job {job_id} queued for re-scoring. The next run re-crawls all "
+                f"{job.get('total_domains') or 'its'} domains with the current model.")
     return HELP
 
 
@@ -511,6 +527,41 @@ def result_text(job: dict, counts: dict[str, int], cfg: Config) -> str:
     ])
 
 
+def top_summary_message(job: dict, counts: dict[str, int],
+                        rows: list[dict[str, str]], cfg: Config) -> str:
+    """One actionable digest of the best sites, sent after the detail messages."""
+    limit = _env_int("TOP_SUMMARY", 20)
+    if limit <= 0 or not rows:
+        return ""
+    shown = rows[:limit]
+    lines = [
+        f"TOP {len(shown)} — job {job['job_id']}",
+        f"{counts['checked']}/{counts['total']} checked · {counts['wordpress']} WordPress · "
+        f"{counts['leads']} leads (score >= {cfg.lead_score:g})",
+        "",
+    ]
+    for index, row in enumerate(shown, 1):
+        score = _clean(row.get("score"))
+        try:
+            score = f"{float(score):g}"
+        except ValueError:
+            score = score or "?"
+        name = _clean(row.get("name"))[:36]
+        head = (f"{index}. {score} · {_clean(row.get('tier'))} · "
+                f"{name} — {_clean(row.get('domain'))}")
+        contact = _clean(row.get("email")) or _clean(row.get("phone"))
+        if contact:
+            head += f" · {contact[:34]}"
+        lines.append(head)
+        reasons = _clean(row.get("top_reasons"))
+        if reasons:
+            lines.append(f"   {reasons[:100]}")
+    if len(rows) > len(shown):
+        lines.append("")
+        lines.append(f"{len(rows) - len(shown)} more in the site messages above.")
+    return "\n".join(lines)
+
+
 def send_report(client: Any, con: Any, job: dict, counts: dict[str, int],
                 report_path: str | None, cfg: Config) -> int:
     """Deliver one message per WordPress site. No attachment is ever sent."""
@@ -535,6 +586,9 @@ def send_report(client: Any, con: Any, job: dict, counts: dict[str, int],
         for index, row in enumerate(rows, 1):
             print(site_message(index, len(rows), row))
             print()
+        digest = top_summary_message(job, counts, rows, cfg)
+        if digest:
+            print(digest)
         return 0
 
     if delivered == 0 and not _notify(client, chat_id, header):
@@ -556,9 +610,13 @@ def send_report(client: Any, con: Any, job: dict, counts: dict[str, int],
                 f"Sending stopped at #{delivered} of {len(rows)} ({exc}).\n"
                 f"/retry {job['job_id']} will continue from there.")
         raise
-    _notify(client, chat_id,
-            f"Done — {job['job_id']}: {sent} WordPress site(s) sent, "
-            f"{counts['leads']} at or above {cfg.lead_score:g}.")
+    digest = top_summary_message(job, counts, rows, cfg)
+    if digest:
+        _notify(client, chat_id, digest)
+    else:
+        _notify(client, chat_id,
+                f"Done — {job['job_id']}: {sent} WordPress site(s) sent, "
+                f"{counts['leads']} at or above {cfg.lead_score:g}.")
     store.set_kv(con, progress_key, "0")  # finished: a manual /retry resends all
     return sent
 
@@ -611,6 +669,14 @@ def process_job(client: Any, con: Any, cfg: Config, job: dict,
                   f"{counts['deferred']} deferred")
             return False
 
+    render_and_send(client, con, cfg, job)
+    return True
+
+
+def render_and_send(client: Any, con: Any, cfg: Config, job: dict) -> dict[str, int]:
+    """Regenerate the job report from stored scores, then deliver it."""
+    job_id = job["job_id"]
+    job_dir = os.path.join(cfg.upload_dir, job_id)
     report_dir = os.path.join(job_dir, "out")
     _run([sys.executable, os.path.join(BASE_DIR, "report.py"),
           "--db", cfg.db_path,
@@ -626,7 +692,7 @@ def process_job(client: Any, con: Any, cfg: Config, job: dict,
     job = store.get_job(con, job_id) or job
     send_report(client, con, job, counts, report_path, cfg)
     print(f"{job_id}: done, {counts['wordpress']} wordpress, {counts['leads']} leads")
-    return True
+    return counts
 
 
 def process_jobs(client: Any, con: Any, cfg: Config) -> int:
@@ -637,8 +703,12 @@ def process_jobs(client: Any, con: Any, cfg: Config) -> int:
         if job is None:
             break
         attempted.add(job["job_id"])
+        force = store.get_kv(con, f"rescore_{job['job_id']}") == "1"
+        if force:
+            store.set_kv(con, f"rescore_{job['job_id']}", "0")
+            store.set_kv(con, f"sending_{job['job_id']}", "0")
         try:
-            if process_job(client, con, cfg, job):
+            if process_job(client, con, cfg, job, force=force):
                 finished += 1
         except Exception as exc:
             store.set_job_status(con, job["job_id"], "failed", error=str(exc), finished=True)
@@ -668,6 +738,8 @@ def main() -> int:
     ap.add_argument("--no-process", action="store_true", help="ingest only, do not score")
     ap.add_argument("--rescore", metavar="JOB_ID",
                     help="re-crawl and re-send one existing job (new scoring)")
+    ap.add_argument("--resend", metavar="JOB_ID",
+                    help="re-render and re-send an existing report without crawling")
     args = ap.parse_args()
 
     load_dotenv()
@@ -708,6 +780,14 @@ def main() -> int:
             job = store.get_job(con, args.rescore) or job
             finished = process_job(client, con, cfg, job, force=True)
             print(f"rescore: {'finished' if finished else 'deferred'}")
+            return 0
+
+        if args.resend:
+            job = store.get_job(con, args.resend)
+            if job is None:
+                raise SystemExit(f"no job {args.resend!r}")
+            store.set_kv(con, f"sending_{args.resend}", "0")
+            render_and_send(client, con, cfg, job)
             return 0
 
         if not args.no_process:

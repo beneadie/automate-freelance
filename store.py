@@ -216,9 +216,20 @@ def mark_seen(
     score: float | None,
     wordpress: bool | None,
     requested: str | None = None,
+    keep_better: bool = False,
 ) -> None:
     if not registrable:
         return
+    if keep_better:
+        # A rescan must not erase a good result because the site timed out this
+        # time. Transient failures keep the previous "scored" row.
+        existing = con.execute(
+            "SELECT status FROM seen WHERE registrable = ?", (registrable,)
+        ).fetchone()
+        if existing and existing[0] == "scored" and status in (
+            "unreachable", "blocked", "http_error"
+        ):
+            return
     now = _now()
     wp = None if wordpress is None else int(wordpress)
     con.execute(
@@ -396,11 +407,12 @@ def job_domain_set(con: sqlite3.Connection, job_id: str) -> set[str]:
 
 def job_counts(con: sqlite3.Connection, job_id: str, lead_score: float = 40.0) -> dict[str, int]:
     row = con.execute(
-        "SELECT COUNT(*) AS total, "
-        "  SUM(CASE WHEN s.registrable IS NOT NULL THEN 1 ELSE 0 END) AS checked, "
-        "  SUM(CASE WHEN s.wordpress = 1 THEN 1 ELSE 0 END) AS wordpress, "
-        "  SUM(CASE WHEN st.score >= ? THEN 1 ELSE 0 END) AS leads, "
-        "  SUM(CASE WHEN s.status IN ('blocked', 'unreachable', 'http_error') THEN 1 ELSE 0 END) AS blocked "
+        "SELECT COUNT(DISTINCT jd.registrable) AS total, "
+        "  COUNT(DISTINCT CASE WHEN s.registrable IS NOT NULL THEN jd.registrable END) AS checked, "
+        "  COUNT(DISTINCT CASE WHEN s.wordpress = 1 THEN jd.registrable END) AS wordpress, "
+        "  COUNT(DISTINCT CASE WHEN st.score >= ? THEN jd.registrable END) AS leads, "
+        "  COUNT(DISTINCT CASE WHEN s.status IN ('blocked', 'unreachable', 'http_error') "
+        "       THEN jd.registrable END) AS blocked "
         "FROM job_domains jd "
         "LEFT JOIN seen s ON s.registrable = jd.registrable OR s.requested = jd.registrable "
         "LEFT JOIN sites st ON st.registrable = jd.registrable OR st.requested = jd.registrable "

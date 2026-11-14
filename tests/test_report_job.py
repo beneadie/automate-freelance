@@ -123,6 +123,33 @@ class ReportJobScopeTests(unittest.TestCase):
             self.assertEqual(stats["wordpress"], 1)
             self.assertEqual(stats["deferred"], 0)
 
+    def test_small_job_with_more_wordpress_than_plain_pages(self) -> None:
+        # Regression: the WordPress share CI divided by the non-WordPress count,
+        # so a job with 2 WordPress and 1 plain page produced a negative
+        # variance and crashed.
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "leads.db")
+            con = store.connect(db)
+            store.create_job(con, "job-w", 1, 1, "w.csv", "hash-w", 10)
+            store.add_job_domains(con, "job-w", {"a.ie", "b.ie", "c.ie"})
+            _save_site(con, "a.ie", 70.0)
+            _save_site(con, "b.ie", 50.0)
+            store.mark_seen(con, "c.ie", "not_wordpress", "not_wordpress", None, False)
+            con.close()
+
+            proc = subprocess.run(
+                [sys.executable, os.path.join(BASE_DIR, "report.py"),
+                 "--db", db, "--outdir", os.path.join(tmp, "out"),
+                 "--job-id", "job-w"],
+                cwd=BASE_DIR, capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            with open(os.path.join(tmp, "out", "stats.json"), encoding="utf-8") as fh:
+                stats = json.load(fh)
+            self.assertEqual(stats["wordpress"], 2)
+            self.assertEqual(stats["checked"], 3)
+
     def test_missing_job_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "leads.db")

@@ -9,11 +9,31 @@ Usage:
     python score.py -f domains.txt
     python score.py -f domains.txt --batch 200 --workers 8
     python score.py --ignore-robots example.com
+    python score.py -f domains.txt --candidates data/jobs/x/candidates.json
 
 Every signal that contributes points is printed with its points, so a score can
 always be explained. Only WordPress sites are written to SQLite (full row with
 facts and signals); every other outcome gets a minimal row in the crawl ledger
 so --batch keeps moving. Nothing else is written to disk.
+
+Scoring is v2 and deliberately ranks *need and fit*, not size:
+
+    Defects      45  broken TLS, no HTTPS, no mobile layout, dated front end,
+                     heavy page, slow server, accessibility gaps
+    Target fit   30  small-business category keywords (solicitor, accountant,
+                     craft, butcher, ...), small site, small shop
+    Neglect      15  stale copyright, no new content, untouched theme, old core
+    Reachability 15  email, phone, contact form
+
+Content volume no longer earns points; past 500 items it costs them, because a
+3,000-page retailer is not a cold-email lead. `--candidates` supplies the
+business name and category from discover.py so keywords can be matched against
+what the directory says, the page title and the meta description.
+
+A certificate that fails validation is a defect, not an outage: the page is
+re-fetched with verification off, flagged `bad_tls`, and still scored. A
+homepage is checked for responsive breakpoints in its theme CSS, because every
+modern theme emits a viewport meta tag whether or not the layout responds.
 
 Outcomes are explicit. A site is never reported as "not WordPress" unless a real
 200 page was fetched and no WordPress signatures were present. Sites that refuse
@@ -31,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -139,8 +160,8 @@ SMALL_BUSINESS_KEYWORDS = (
     "solicitor", "attorney", "lawyer", "legal", "notary", "patent",
     "accountant", "accounting", "bookkeep", "audit", "payroll", "tax",
     "auctioneer", "estate agent", "real estate", "architect", "engineer",
-    "surveyor", "valuation", "mortgage broker", "insurance broker",
-    "dentist", "dental", "orthodont", "vet", "veterinary", "physio",
+    "surveyor", "valuation", "mortgage", "insurance broker", "insurance",
+    "dentist", "dental", "medical", "orthodont", "vet", "veterinary", "physio",
     "chiropract", "osteopath", "optician", "optometrist", "pharmacy",
     "chemist", "clinic", "medical centre", "podiatr", "counsellor",
     "psychotherap", "creche", "montessori", "childcare", "preschool",
@@ -154,6 +175,7 @@ SMALL_BUSINESS_KEYWORDS = (
     "restaurant", "bistro", "gastropub", "guesthouse", "florist", "flowers",
     "craft", "pottery", "ceramic", "jewellery", "jewelry", "knitwear",
     "woollen", "woolen", "tweed", "boutique", "bookshop", "bicycle",
+    "distillery", "brewery", "brewing", "gin", "whiskey", "whisky",
     "hardware", "groomer", "kennel", "cattery", "equestrian", "saddlery",
     "taxi", "print", "signage", "photographer", "photography", "dance",
     "tutoring", "grinds", "gym", "fitness", "yoga", "pilates",
@@ -163,7 +185,7 @@ SMALL_BUSINESS_KEYWORDS = (
 # Weaker hints: real but ambiguous, so worth less than a solicitor or a bakery.
 WEAK_KEYWORDS = (
     "hotel", "pub", "bar", "school", "arts", "centre", "shop", "store",
-    "market", "motors", "foods", "supplies", "services",
+    "market", "motors", "foods", "supplies",
 )
 
 # Institutions and enterprises: they buy websites, but not from a cold email.
@@ -176,7 +198,7 @@ ENTERPRISE_KEYWORDS = (
 
 # --- scoring bands -------------------------------------------------------
 CAPS = {"Defects": 45, "Target fit": 30, "Neglect": 15, "Reachability": 15}
-TIERS = ((68.0, "A"), (52.0, "B"), (36.0, "C"))
+TIERS = ((48.0, "A"), (40.0, "B"), (32.0, "C"))
 
 SCORE_VERSION = "v2"
 
@@ -287,7 +309,13 @@ def months_since(year: int, month: int) -> int:
 
 def _keyword_hits(text: str, words: tuple[str, ...]) -> list[str]:
     low = (text or "").lower()
-    return [w for w in words if re.search(r"(?<![a-z])" + re.escape(w), low)]
+    hits = []
+    for word in words:
+        # Leading boundary plus an optional plural: "accountant" matches
+        # "accountants", but "pub" no longer matches "public".
+        if re.search(r"(?<![a-z])" + re.escape(word) + r"(?:es|s)?(?![a-z])", low):
+            hits.append(word)
+    return hits
 
 
 def classify_fetch_error(exc: BaseException) -> str:
@@ -479,6 +507,7 @@ def parse_homepage(html: str, base_url: str, elapsed: float, scheme: str) -> dic
         r'href=["\']([^"\']+\.css[^"\']*)["\']', html, re.I)]
     style_urls = [u for u in style_urls if "wp-content" in u][:3]
     inline_media = len(re.findall(r"@media", html, re.I))
+    inline_fixed = len(re.findall(r"(?:min-)?width\s*:\s*(?:9\d\d|1\d{3})px", html, re.I))
 
     legacy = legacy_era_markers(soup, html, plugin_slugs, theme_slugs, text_lower)
 
@@ -495,6 +524,7 @@ def parse_homepage(html: str, base_url: str, elapsed: float, scheme: str) -> dic
         "meta_description": meta_description[:300],
         "style_urls": style_urls,
         "inline_media": inline_media,
+        "inline_fixed_widths": inline_fixed,
         "lang": lang,
         "img_count": len(imgs),
         "alt_ratio": alt_ratio,
@@ -710,7 +740,6 @@ def collect(target: str, ignore_robots: bool, business_live: bool | None = None)
         facts["https"] = False
     facts["rest"] = {}
     facts["business_live"] = business_live
-    facts.update(probe_responsive(s, facts.get("style_urls", []), facts.get("inline_media", 0)))
     rep.facts = facts
 
     if not sigs:
@@ -718,6 +747,10 @@ def collect(target: str, ignore_robots: bool, business_live: bool | None = None)
         rep.rest_status = "not_wordpress"
         rep.wordpress = False
         return rep
+
+    # Only worth fetching theme CSS for sites we will actually score.
+    facts.update(probe_responsive(s, facts.get("style_urls", []), facts.get("inline_media", 0)))
+    facts["fixed_widths"] = (facts.get("fixed_widths") or 0) + facts.pop("inline_fixed_widths", 0)
 
     rep.wordpress = True
     if facts["generator"]:
@@ -780,15 +813,18 @@ def score(rep: SiteReport, meta: dict[str, Any] | None = None) -> None:
 
     media = int(f.get("media_queries") or 0)
     fixed = int(f.get("fixed_widths") or 0)
+    inspected = bool(f.get("css_fetched")) or bool(f.get("inline_media"))
     if not f.get("has_viewport"):
         add("Defects", "no_mobile_layout", 15, "no viewport meta tag")
     elif f.get("zoom_blocked"):
         add("Defects", "zoom_blocked", 6, "mobile zoom disabled")
+    elif inspected and media == 0:
+        add("Defects", "no_mobile_layout", 12, "no responsive breakpoints in the theme CSS")
     elif fixed and media <= 3:
-        add("Defects", "fixed_width_layout", 12,
+        add("Defects", "fixed_width_layout", 10,
             f"{fixed} fixed widths, {media} media queries")
     elif fixed >= 3 and media <= 8:
-        add("Defects", "weak_responsive", 6,
+        add("Defects", "weak_responsive", 5,
             f"{fixed} fixed widths, {media} media queries")
 
     legacy = [m for m in (f.get("legacy_markers") or [])
@@ -1135,7 +1171,8 @@ def main() -> int:
         # Only WordPress sites get a full row (facts, reasons, REST index).
         if con:
             store.mark_seen(con, rep.registrable, rep.status, rep.tier, rep.score,
-                            rep.wordpress, requested=rep.requested)
+                            rep.wordpress, requested=rep.requested,
+                            keep_better=args.force)
         if rep.wordpress:
             row = build_row(rep)
             raw_index = row.pop("raw_index", None)

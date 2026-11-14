@@ -97,6 +97,21 @@ class IngestTests(unittest.TestCase):
         self.assertIn("1/2 checked", status)
         self.assertIn("1 WP", status)
 
+    def test_rescore_command_queues_a_forced_recrawl(self) -> None:
+        job_id = run_tick.ingest_file(self.client, self.con, self.cfg, self.csv_path,
+                                      chat_id=1, original_name="source.csv")
+        store.set_job_status(self.con, job_id, "done", finished=True)
+        reply = run_tick.command_reply(self.con, self.cfg, f"/rescore {job_id}")
+
+        self.assertIn("queued for re-scoring", reply)
+        self.assertEqual(store.get_job(self.con, job_id)["status"], "received")
+        self.assertEqual(store.get_kv(self.con, f"rescore_{job_id}"), "1")
+        self.assertEqual(store.get_kv(self.con, f"sending_{job_id}"), "0")
+
+    def test_rescore_command_needs_a_known_job(self) -> None:
+        self.assertIn("Usage", run_tick.command_reply(self.con, self.cfg, "/rescore"))
+        self.assertIn("No job", run_tick.command_reply(self.con, self.cfg, "/rescore nope"))
+
     def test_command_status_and_retry(self) -> None:
         job_id = run_tick.ingest_file(self.client, self.con, self.cfg, self.csv_path,
                                       chat_id=1, original_name="source.csv")

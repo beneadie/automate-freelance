@@ -118,6 +118,19 @@ class JobStoreTests(unittest.TestCase):
                    requested="bankofireland.com")
         self.assertEqual(store.job_counts(self.con, "job-p")["deferred"], 0)
 
+    def test_counts_are_not_inflated_by_a_redirect_alias(self) -> None:
+        # One job domain can match two ledger rows: its own name and a
+        # redirect alias. The funnel must still count the domain once.
+        store.create_job(self.con, "job-d", 1, 1, "d.csv", "hash-d", 10)
+        store.add_job_domains(self.con, "job-d", {"a.ie"})
+        _save_site(self.con, "a.ie", 50.0)
+        store.mark_seen(self.con, "a.ie:443", "scored", "B", 50.0, True, requested="a.ie")
+
+        counts = store.job_counts(self.con, "job-d")
+        self.assertEqual(counts["total"], 1)
+        self.assertEqual(counts["checked"], 1)
+        self.assertEqual(counts["deferred"], 0)
+
     def test_migration_adds_requested_to_old_databases(self) -> None:
         columns = {row[1] for row in self.con.execute("PRAGMA table_info(sites)")}
         self.assertIn("requested", columns)
